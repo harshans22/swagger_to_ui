@@ -2,3 +2,7 @@ requests
 pyyaml
 openai
 python-dotenv
+langchain
+langchain-openai
+langchain-community
+langchain-core

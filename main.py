@@ -1,225 +1,224 @@
 import os
-import re
 import json
-from typing import Any, Dict, List, Optional, Union
-from openai import AzureOpenAI
-from parser.url_loader import load_from_url
-from parser.swagger_parser import parse_swagger
+from typing import Any, Dict, Union, List
+from datetime import datetime
 from dotenv import load_dotenv
+import yaml
 
-# Load environment variables from .env file
+from parser import load_from_url, SwaggerParser
+from core.summary import create_enhanced_api_summary
+from core.ui_generation import create_ui_with_langchain
+from core.static_ui_builder import write_static_ui
+
 load_dotenv()
-
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 
+# ---------------------- Loading & Parsing ----------------------
 
-def create_purified_api_summary(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a clean, comprehensive summary of all API endpoints for LLM consumption"""
-    api_summary = {
-        "info": {
-            "title": parsed['info'].get('title', ''),
-            "description": parsed['info'].get('description', ''),
-            "version": parsed['info'].get('version', '')
-        },
-        "baseUrl": parsed.get("servers", [{"url": ""}])[0].get("url", ""),
-        "endpoints": []
-    }
-    
-    for path, path_data in parsed["paths"].items():
-        http_methods = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace']
-        operations = {k: v for k, v in path_data.items() if k in http_methods}
-        
-        for method, op in operations.items():
-            endpoint = {
-                "path": path,
-                "method": method.upper(),
-                "operationId": op.get("operationId", ""),
-                "summary": op.get("summary", ""),
-                "description": op.get("description", ""),
-                "parameters": [],
-                "requestBody": None,
-                "responses": {}
-            }
-            
-            # Parameters with full schema expansion
-            for param in op.get("parameters", []):
-                schema = param.get("schema") or {}
-                param_info = {
-                    "name": param.get("name"),
-                    "in": param.get("in"),
-                    "required": param.get("required", False),
-                    "type": schema.get("type", "unknown"),
-                    "description": param.get("description", "")
-                }
-                
-                # Handle object parameters (like DummyDto)
-                if schema.get("type") == "object" and "properties" in schema:
-                    param_info["properties"] = {}
-                    for prop_name, prop_schema in schema["properties"].items():
-                        param_info["properties"][prop_name] = {
-                            "type": prop_schema.get("type", "unknown"),
-                            "required": prop_name in schema.get("required", []),
-                            "description": prop_schema.get("description", "")
-                        }
-                
-                endpoint["parameters"].append(param_info)
-            
-            # Request Body
-            rb = op.get("requestBody")
-            if rb and "content" in rb:
-                for content_type, content_data in rb["content"].items():
-                    schema = content_data.get("schema") or {}
-                    endpoint["requestBody"] = {
-                        "contentType": content_type,
-                        "required": rb.get("required", False),
-                        "type": schema.get("type", "object"),
-                        "description": schema.get("description", "")
-                    }
-                    break
-            
-            # Responses
-            for status_code, resp in op.get("responses", {}).items():
-                response_info = {
-                    "description": resp.get("description", ""),
-                    "content": {}
-                }
-                
-                for content_type, content_data in resp.get("content", {}).items():
-                    schema = content_data.get("schema") or {}
-                    example = None
-                    if "examples" in content_data and content_data["examples"]:
-                        example = next(iter(content_data["examples"].values())).get("value")
-                    elif "example" in content_data:
-                        example = content_data["example"]
-                    
-                    response_info["content"][content_type] = {
-                        "type": schema.get("type", "object"),
-                        "example": example
-                    }
-                
-                endpoint["responses"][status_code] = response_info
-            
-            api_summary["endpoints"].append(endpoint)
-    
-    return api_summary
 
-def generate_full_ui_with_azure_openai(api_summary: Dict[str, Any]) -> str:
-    """Generate complete integrated UI using Azure OpenAI"""
-    
-    client = AzureOpenAI(
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version=AZURE_OPENAI_API_VERSION,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT
-    )
-    
-    prompt = f"""
-You are an expert web developer. Create a complete, fully functional web application with the following requirements:
+def load_openapi_spec(source: str) -> Union[str, Dict[str, Any]]:
+    """Load OpenAPI specification from URL or file path"""
+    if source.startswith(("http://", "https://")):
+        return load_from_url(source)
+    with open(source, "r", encoding="utf-8") as f:
+        content = f.read()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return yaml.safe_load(content)
 
-API Information:
-{json.dumps(api_summary, indent=2)}
 
-Requirements:
-1. Create a single-page application with HTML, CSS, and JavaScript
-2. Build a comprehensive UI that integrates ALL endpoints listed above
-3. Include navigation between different API operations
-4. Create forms for POST/PUT endpoints with proper validation
-5. Display responses in a user-friendly format
-6. Handle all parameter types including objects with nested properties
-7. Add error handling and loading states
-8. Make the UI clean, modern, and responsive
-9. Connect all routes and show relationships between endpoints
-10. Include a main dashboard/navigation page
+def detect_openapi_version(content: Union[str, Dict[str, Any]]) -> str:
+    """Detect OpenAPI version from content"""
+    if isinstance(content, str):
+        try:
+            spec = json.loads(content)
+        except json.JSONDecodeError:
+            spec = yaml.safe_load(content)
+    else:
+        spec = content
+    return spec.get("openapi") or spec.get("swagger") or "unknown"
 
-Technical Requirements:
-- Use vanilla HTML, CSS, and JavaScript (no frameworks)
-- Use fetch() for all API calls to {api_summary['baseUrl']}
-- Create separate sections/pages for each endpoint
-- Add proper form validation for required fields
-- Show API responses in formatted JSON or user-friendly cards
-- Include navigation menu to switch between different API operations
-- Add loading spinners and error messages
 
-Structure:
-- Create one complete HTML file with embedded CSS and JavaScript
-- Organize the UI with clear sections for each endpoint
-- Add a main navigation/dashboard area
-- Include breadcrumbs or active state indicators
+# ---------------------- Validation & Reporting ----------------------
 
-Please provide the complete, ready-to-use HTML file with embedded CSS and JavaScript.
-"""
 
-    try:
-        response = client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": "You are an expert web developer who creates complete, functional web applications."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=4000
-        )
-        
-        return response.choices[0].message.content
-    
-    except Exception as e:
-        print(f"❌ Error calling Azure OpenAI: {e}")
-        return None
+def validate_openapi_spec(spec: Dict[str, Any]) -> List[str]:
+    """Validate OpenAPI specification and return warnings"""
+    warnings: List[str] = []
+    if "info" not in spec:
+        warnings.append("Missing 'info' section")
+    else:
+        if "title" not in spec["info"]:
+            warnings.append("Missing 'info.title'")
+    if not spec.get("paths"):
+        warnings.append("No paths defined")
+    for path, methods in spec.get("paths", {}).items():
+        for method, operation in methods.items():
+            if isinstance(operation, dict) and operation.get("deprecated"):
+                warnings.append(f"Deprecated endpoint: {method.upper()} {path}")
+    return warnings
 
-def save_ui_files(ui_content: str, base_dir: str = "ui"):
-    """Save the generated UI content to files"""
+
+# ---------------------- UI Saving ----------------------
+
+
+def save_ui_files(ui_content: str, base_dir: str = "ui") -> str:
+    """Save the generated UI file only"""
     os.makedirs(base_dir, exist_ok=True)
-    
-    # Save as complete HTML file
     html_file = os.path.join(base_dir, "index.html")
     with open(html_file, "w", encoding="utf-8") as f:
         f.write(ui_content)
-    
-    print(f"✅ Complete UI saved to {html_file}")
-    print(f"🌐 Open {html_file} in your browser to use the application")
+    return html_file
 
-if __name__ == "__main__":
-    # Check environment variables
-    if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY]):
-        print("❌ Please set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY environment variables")
-        exit(1)
+
+# ---------------------- Main Flow ----------------------
+
+
+def main():
+    print("🚀 Advanced Swagger/OpenAPI to UI Generator")
+    print("=" * 50)
+
+    source = input("📁 Enter OpenAPI spec URL or file path: ").strip()
+    if not source:
+        print("❌ No source provided")
+        return
+
+    print("\n🎯 Choose UI generation mode:")
+    print("1. Semantic App UI (recommended) - Creates contextual domain-specific interface")
+    print("2. API Console - Simple testing interface")
+    print("3. Deterministic Static - No LLM, basic forms")
     
-    url = input("🔗 Enter Swagger/OpenAPI URL: ").strip()
+    mode = input("Select mode (1-3): ").strip()
     
+    domain_context = ""
+    use_semantic = False
+    deterministic = False
+    
+    if mode == "1":
+        use_semantic = True
+        domain_context = input("\n💭 Describe your product/domain & desired UX\n(e.g., 'YouTube-like video platform with user channels and subscriptions'): ").strip()
+        if not domain_context:
+            domain_context = "A modern web application with intuitive user experience"
+    elif mode == "2":
+        use_semantic = False
+        domain_context = input("\n💭 Optional: Brief description of the API purpose: ").strip()
+    elif mode == "3":
+        deterministic = True
+    else:
+        print("❌ Invalid mode, using semantic mode")
+        use_semantic = True
+
     try:
-        # Load and parse swagger
-        content = load_from_url(url)
-        parsed = parse_swagger(content)
-        
-        print(f"\n📊 API Title: {parsed['info'].get('title')}")
-        print(f"📊 Total Paths: {len(parsed['paths'])}")
-        
-        # Create purified API summary
-        api_summary = create_purified_api_summary(parsed)
-        
-        print(f"\n🔄 Generating comprehensive UI for all {len(api_summary['endpoints'])} endpoints...")
-        
-        # Generate complete UI with Azure OpenAI
-        ui_content = generate_full_ui_with_azure_openai(api_summary)
-        
-        if ui_content:
-            # Save UI files
-            save_ui_files(ui_content)
-            
-            print("\n✅ UI Generation Complete!")
-            print("📁 Files created:")
-            print("   - ui/index.html (Complete application)")
-            print("\n🚀 Next steps:")
-            print("   1. Open ui/index.html in your browser")
-            print("   2. Test all API endpoints through the UI")
-            print("   3. Ensure your API server is running on the specified endpoint")
+        print(f"\n📥 Loading spec from: {source}")
+        content = load_openapi_spec(source)
+        version = detect_openapi_version(content)
+        print(f"📋 Detected OpenAPI version: {version}")
+
+        if isinstance(content, str):
+            try:
+                spec_dict = json.loads(content)
+            except json.JSONDecodeError:
+                spec_dict = yaml.safe_load(content)
         else:
-            print("❌ Failed to generate UI content")
-    
+            spec_dict = content
+
+        warnings = validate_openapi_spec(spec_dict)
+        if warnings:
+            print("⚠️  Specification warnings:")
+            for w in warnings[:5]:
+                print(f"   • {w}")
+            if len(warnings) > 5:
+                print(f"   ... and {len(warnings) - 5} more warnings")
+
+        print("⚙️  Parsing specification...")
+        parser = SwaggerParser(spec_dict if isinstance(spec_dict, dict) else json.loads(spec_dict))
+        parsed = parser.parse()
+        print(f"✅ Parsed {len(parsed.get('paths', {}))} paths")
+
+        print("📊 Building API summary...")
+        api_summary = create_enhanced_api_summary(parsed)
+        print(f"📈 Total endpoints: {api_summary['totalEndpoints']}")
+
+        if deterministic:
+            print("🔧 Generating deterministic static UI...")
+            paths = write_static_ui(api_summary)
+            print("✅ Generated files:")
+            for name, p in paths.items():
+                print(f"   • {name}: {p}")
+            return
+
+        use_llm = all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY])
+        if not use_llm:
+            print("❌ Azure OpenAI credentials not found. Use deterministic mode or set env vars.")
+            return
+
+        if use_semantic:
+            print("🧠 Generating semantic domain-aware UI via LLM...")
+        else:
+            print("🤖 Generating API console UI via LLM...")
+            
+        # Update chunker to use semantic analysis if requested
+        from core.chunking import APIChunker
+        chunker = APIChunker(max_endpoints_per_chunk=6, use_semantic_analysis=use_semantic)
+        
+        ui_content = create_ui_with_langchain(api_summary, {
+            "endpoint": AZURE_OPENAI_ENDPOINT,
+            "api_key": AZURE_OPENAI_API_KEY,
+            "api_version": AZURE_OPENAI_API_VERSION,
+            "deployment": AZURE_OPENAI_DEPLOYMENT
+        }, domain_context=domain_context)
+        
+        if not ui_content:
+            print("❌ Failed to generate UI")
+            return
+
+        path = save_ui_files(ui_content)
+        print(f"\n🎉 UI Generation Complete!")
+        print(f"📁 File created: {path}")
+        print(f"🌐 Open {path} in your browser to use your application!")
+        
+        # Optionally open in browser
+        try:
+            import webbrowser
+            open_browser = input("\n🚀 Open in browser now? (y/N): ").strip().lower()
+            if open_browser in ['y', 'yes']:
+                webbrowser.open(f"file://{os.path.abspath(path)}")
+        except:
+            pass
+            
     except Exception as e:
-        print(f"❌ Error: {e}")
+        error_message = str(e)
+        
+        # Handle specific Azure OpenAI errors
+        if "429" in error_message or "rate limit" in error_message.lower():
+            print("⏰ Azure OpenAI rate limit reached.")
+            print("💡 Try using deterministic mode (option 3) or wait a minute before retrying.")
+            print("🔧 Consider optimizing your API spec by reducing endpoints or using shorter descriptions.")
+        elif "connection" in error_message.lower() or "timeout" in error_message.lower():
+            print("🌐 Connection issue with Azure OpenAI service.")
+            print("💡 Check your internet connection and Azure OpenAI endpoint configuration.")
+        elif "authentication" in error_message.lower() or "401" in error_message:
+            print("🔑 Authentication failed with Azure OpenAI.")
+            print("💡 Check your AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT in .env file.")
+        else:
+            print(f"❌ Error: {e}")
+            
+        print("\n📋 Full error trace:")
         import traceback
         traceback.print_exc()
+        
+        # Suggest alternatives
+        print("\n🛠️  Alternative solutions:")
+        print("   1. Use deterministic mode (restart and choose option 3)")
+        print("   2. Check .env file for correct Azure OpenAI credentials")
+        print("   3. Simplify your OpenAPI spec to reduce token usage")
+        print("   4. Wait 60 seconds and retry if rate limited")
+
+
+if __name__ == "__main__":
+    main()
